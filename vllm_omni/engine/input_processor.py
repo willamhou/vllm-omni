@@ -121,13 +121,13 @@ class OmniInputProcessor(InputProcessor):
         request_id: str,
         prompt: PromptType | ProcessorInputs,
         params: SamplingParams | PoolingParams,
+        supported_tasks: tuple[SupportedTask, ...] = ("generate",),
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
-        supported_tasks: tuple[SupportedTask, ...] | None = None,
         resumable: bool = False,
     ) -> OmniEngineCoreRequest:
         """Process input prompt into an engine core request.
@@ -141,6 +141,7 @@ class OmniInputProcessor(InputProcessor):
             request_id: Unique identifier for this request
             prompt: Input prompt (text, token IDs, embeddings, or multimodal)
             params: Sampling or pooling parameters for generation
+            supported_tasks: Tuple of supported tasks for validation
             arrival_time: Optional arrival timestamp (defaults to current time)
             lora_request: Optional LoRA adapter request
             tokenization_kwargs: Optional additional tokenization arguments
@@ -148,19 +149,17 @@ class OmniInputProcessor(InputProcessor):
             priority: Request priority (higher values processed first)
             data_parallel_rank: Optional data parallel rank for distributed
                 inference
+            resumable: Whether the request supports streaming input
 
         Returns:
-            Tuple of (prompt_string, OmniEngineCoreRequest) where:
-                - prompt_string: The original prompt as a string, or None if
-                  using embeddings
-                - OmniEngineCoreRequest: Processed request ready for the engine
+            OmniEngineCoreRequest ready for the engine
 
         Raises:
             ValueError: If data_parallel_rank is out of range or prompt_embeds
                 has incorrect shape
         """
-        self._validate_lora(lora_request)
         self._validate_params(params, supported_tasks)
+        self._validate_lora(lora_request)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -187,8 +186,6 @@ class OmniInputProcessor(InputProcessor):
 
         self._platform_validate_request(processed_inputs, params)
 
-        eos_token_id = self.renderer.get_eos_token_id()
-
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
         self._validate_model_inputs(encoder_inputs, decoder_inputs)
 
@@ -209,7 +206,10 @@ class OmniInputProcessor(InputProcessor):
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds)
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
-            sampling_params.update_from_generation_config(self.generation_config_fields, eos_token_id)
+            sampling_params.update_from_generation_config(
+                self.generation_config_fields,
+                self.renderer.get_eos_token_id(),
+            )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
         else:

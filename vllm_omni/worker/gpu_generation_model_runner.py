@@ -646,6 +646,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
+                    use_spec_decode=self.speculative_config is not None,
                 )
 
         with self.maybe_dummy_run_with_lora(
