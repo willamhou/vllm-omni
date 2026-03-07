@@ -313,7 +313,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     model_name: str,
-    tokenizer: PreTrainedTokenizerBase | None,
+    tokenizer: TokenizerLike | None,
     input_requests: list[SampleRequest],
     logprobs: int | None,
     request_rate: float,

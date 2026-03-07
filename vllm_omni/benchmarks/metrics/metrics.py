@@ -134,7 +134,7 @@ def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
     dur_s: float,
-    tokenizer: PreTrainedTokenizerBase | None,
+    tokenizer: TokenizerLike | None,
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
     task_type,
