@@ -21,13 +21,13 @@ RUN apt-get update && \
 # RUN uv pip install --system --upgrade --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/097eb544e9a22810c9b7a59e586b61627b308362
 
 RUN uv pip install --system --no-cache-dir ".[dev]"
-RUN uv pip install --system --upgrade \
-    "flashinfer-cubin==0.6.4" \
-    "nvidia-cublas-cu12==12.9.1.4" \
-    "numpy==2.2.6"
-RUN uv pip install --system --upgrade \
-    "flashinfer-jit-cache==0.6.4" \
-    --index-url https://flashinfer.ai/whl/cu129
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+# RUN uv pip install --system --upgrade \
+#     "flashinfer-cubin==0.6.4" \
+#     "nvidia-cublas-cu12==12.9.1.4" \
+#     "numpy==2.2.6"
+# RUN uv pip install --system --upgrade \
+#     "flashinfer-jit-cache==0.6.4" \
+#     --index-url https://flashinfer.ai/whl/cu129
+# RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
