@@ -340,6 +340,11 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
                 seq_len=seq_len,
                 mm_counts=mm_counts,
             )
+            if audio_tokens is None:
+                feature_extractor = self.get_feature_extractor()
+                max_audio_samples = feature_extractor.chunk_length * feature_extractor.sampling_rate
+                max_audio_tokens = int(_get_feat_extract_output_lengths(torch.tensor([max_audio_samples])).item())
+                audio_tokens = {"audio": max_audio_tokens}
             mm_max_tokens["audio"] = audio_tokens["audio"]
 
         return mm_max_tokens
@@ -769,8 +774,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
-        # OMNI: audio_tower.forward() returns hidden_states tensor directly
-        audio_features = audio_outputs
+        audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
         return audio_features.split(audio_output_lengths.tolist())
 
 
