@@ -34,7 +34,7 @@ Lead maintainers are responsible for the overall direction and strategy of the p
 Committers have write access and merge rights. They typically have deep expertise in specific areas of this project and shepherd the community contributions:
 
 - [@david6666666](https://github.com/david6666666)
-- [@gcanlin](https://github.com/gcanlin)
+- [@gcanlin](https://github.com/gcanlin): Hardware plugin and NPU integration
 - [@Isotr0py](https://github.com/Isotr0py)
 - [@linyueqian](https://github.com/linyueqian)
 - [@princepride](https://github.com/princepride)
