@@ -33,14 +33,14 @@ Lead maintainers are responsible for the overall direction and strategy of the p
 
 Committers have write access and merge rights. They typically have deep expertise in specific areas of this project and shepherd the community contributions:
 
-- [@david6666666](https://github.com/david6666666): Quantization and community
+- [@david6666666](https://github.com/david6666666): Quantization and Community Relationship
 - [@gcanlin](https://github.com/gcanlin): Hardware plugin and NPU integration
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization
-- [@linyueqian](https://github.com/linyueqian) TTS and Omni Model
-- [@princepride](https://github.com/princepride)
+- [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
+- [@princepride](https://github.com/princepride):
 - [@SamitHuang](https://github.com/SamitHuang): RL and Diffusion
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
-- [@wtomin](https://github.com/wtomin)
+- [@wtomin](https://github.com/wtomin):
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion and CustomOp
 
 ## Meetings
