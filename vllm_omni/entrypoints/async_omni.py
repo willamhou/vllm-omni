@@ -136,6 +136,7 @@ class AsyncOmni(EngineClient, OmniBase):
     async def generate(
         self,
         prompt: OmniPromptType | list[OmniPromptType],
+        sampling_params: Any = None,
         request_id: str = "",
         *,
         prompt_text: str | None = None,

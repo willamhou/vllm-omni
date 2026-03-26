@@ -295,8 +295,11 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
-    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+    output = SimpleNamespace(
+        multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code},
+        token_ids=list(range(audio_codes.shape[0] + 1)),
+    )
+    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output], finished=True)])
 
     prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
 
@@ -335,8 +338,11 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
-    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+    output = SimpleNamespace(
+        multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code},
+        token_ids=list(range(audio_codes.shape[0] + 1)),
+    )
+    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output], finished=True)])
 
     prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
 
