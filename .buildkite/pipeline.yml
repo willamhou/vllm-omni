@@ -7,7 +7,7 @@ steps:
       - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
       - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "cpu_queue_release"
 
   # L2 Test
   - label: "Upload Ready Pipeline"
@@ -17,7 +17,7 @@ steps:
     commands:
       - buildkite-agent pipeline upload .buildkite/test-ready.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "cpu_queue_release"
 
   # L3 Test
   - label: "Upload Merge Pipeline"
@@ -27,7 +27,7 @@ steps:
     commands:
       - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "cpu_queue_release"
 
   # L4 Test — main+NIGHTLY=1 (scheduled), or PR with label nightly-test (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"
@@ -37,4 +37,4 @@ steps:
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "cpu_queue_release"

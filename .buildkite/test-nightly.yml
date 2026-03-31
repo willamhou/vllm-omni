@@ -421,4 +421,4 @@ steps:
       - buildkite-agent artifact upload "tests/dfx/perf/results/*.xlsx"
       - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "cpu_queue_release"
