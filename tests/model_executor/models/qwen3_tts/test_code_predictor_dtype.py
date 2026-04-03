@@ -15,7 +15,7 @@ import importlib.util
 import os
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -32,10 +32,6 @@ _BASE = os.path.join(
     "qwen3_tts",
 )
 
-# Keys injected into sys.modules by _setup_mocks / cleaned up by _teardown_mocks.
-_MOCKED_KEYS: list[str] = []
-_SAVED_MODULES: dict[str, types.ModuleType | None] = {}
-
 
 def _load_module(name: str, filename: str):
     path = os.path.abspath(os.path.join(_BASE, filename))
@@ -45,76 +41,58 @@ def _load_module(name: str, filename: str):
     return mod
 
 
-def _mock_module(key: str, mod: object) -> None:
-    """Register a mock in sys.modules and track it for cleanup."""
-    _SAVED_MODULES[key] = sys.modules.get(key)
-    sys.modules[key] = mod  # type: ignore[assignment]
-    _MOCKED_KEYS.append(key)
-
-
-def _setup_mocks():
-    """Install mocks for vllm/vllm_omni dependencies."""
+def _build_mock_modules() -> dict[str, object]:
+    """Build the dict of modules to inject into sys.modules."""
     platforms_mock = MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
-    _mock_module("vllm_omni", MagicMock())
-    _mock_module("vllm_omni.platforms", platforms_mock)
 
     logger_mock = MagicMock()
     logger_mock.init_logger = lambda name: MagicMock()
-    _mock_module("vllm.logger", logger_mock)
-    _mock_module("vllm.config", MagicMock())
 
     vllm_config_mod = MagicMock()
     vllm_config_mod.set_current_vllm_config = lambda cfg: MagicMock(__enter__=MagicMock(), __exit__=MagicMock())
-    _mock_module("vllm.config.vllm", vllm_config_mod)
 
     weight_utils_mock = MagicMock()
     weight_utils_mock.default_weight_loader = lambda p, w: None
-    _mock_module("vllm.model_executor.model_loader.weight_utils", weight_utils_mock)
 
-    # Load config module and register it so relative imports resolve.
-    config_mod = _load_module(
-        "vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts",
-        "configuration_qwen3_tts.py",
-    )
-    _mock_module(
-        "vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts",
-        config_mod,
-    )
-
-    # Create a fake parent package so relative imports in code_predictor work.
     pkg = types.ModuleType("vllm_omni.model_executor.models.qwen3_tts")
     pkg.__path__ = [os.path.abspath(_BASE)]
-    _mock_module("vllm_omni.model_executor", types.ModuleType("vllm_omni.model_executor"))
-    _mock_module(
-        "vllm_omni.model_executor.models",
-        types.ModuleType("vllm_omni.model_executor.models"),
-    )
-    _mock_module("vllm_omni.model_executor.models.qwen3_tts", pkg)
 
-    cp_mod = _load_module(
-        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code_predictor_vllm",
-        "qwen3_tts_code_predictor_vllm.py",
-    )
+    return {
+        "vllm_omni": MagicMock(),
+        "vllm_omni.platforms": platforms_mock,
+        "vllm.logger": logger_mock,
+        "vllm.config": MagicMock(),
+        "vllm.config.vllm": vllm_config_mod,
+        "vllm.model_executor.model_loader.weight_utils": weight_utils_mock,
+        "vllm_omni.model_executor": types.ModuleType("vllm_omni.model_executor"),
+        "vllm_omni.model_executor.models": types.ModuleType("vllm_omni.model_executor.models"),
+        "vllm_omni.model_executor.models.qwen3_tts": pkg,
+    }
+
+
+def _load_target_classes():
+    """Load config and code predictor modules with mocked dependencies.
+
+    Uses patch.dict to ensure sys.modules is always restored, even on failure.
+    """
+    mocks = _build_mock_modules()
+    with patch.dict(sys.modules, mocks):
+        config_mod = _load_module(
+            "vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts",
+            "configuration_qwen3_tts.py",
+        )
+        sys.modules["vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts"] = config_mod
+
+        cp_mod = _load_module(
+            "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code_predictor_vllm",
+            "qwen3_tts_code_predictor_vllm.py",
+        )
 
     return config_mod, cp_mod
 
 
-def _teardown_mocks():
-    """Restore sys.modules to its pre-mock state."""
-    for key in _MOCKED_KEYS:
-        prev = _SAVED_MODULES.get(key)
-        if prev is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = prev
-    _MOCKED_KEYS.clear()
-    _SAVED_MODULES.clear()
-
-
-# Set up mocks, import target classes, then tear down so other tests are unaffected.
-_config_mod, _cp_mod = _setup_mocks()
-_teardown_mocks()
+_config_mod, _cp_mod = _load_target_classes()
 
 Qwen3TTSTalkerCodePredictorConfig = _config_mod.Qwen3TTSTalkerCodePredictorConfig
 Qwen3TTSTalkerConfig = _config_mod.Qwen3TTSTalkerConfig
