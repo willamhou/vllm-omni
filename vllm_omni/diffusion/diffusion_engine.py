@@ -95,6 +95,11 @@ class DiffusionEngine:
         )
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.RLock()
+        # Condition used to let collective_rpc proceed while execute_fn is
+        # running, without allowing a second add_req_and_wait_for_response
+        # to schedule a duplicate execution.
+        self._exec_cond = threading.Condition(self._rpc_lock)
+        self._executing = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
@@ -338,11 +343,18 @@ class DiffusionEngine:
         return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
+        with self._exec_cond:
             target_sched_req_id = self.scheduler.add_request(request)
 
-            # keep scheduling and executing until the target request is finished
-            while True:
+        # keep scheduling and executing until the target request is finished
+        while True:
+            with self._exec_cond:
+                # Wait if another thread is currently executing on the GPU.
+                # This prevents a second caller from scheduling a duplicate
+                # execution for the same (or another) request.
+                while self._executing:
+                    self._exec_cond.wait()
+
                 self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
@@ -357,19 +369,35 @@ class DiffusionEngine:
                 # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
                 # take the single scheduled request here.
                 sched_req_id = sched_output.scheduled_req_ids[0]
-                try:
-                    runner_output = self.execute_fn(sched_output)
-                except EngineDeadError:
-                    raise
-                except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        req_id=sched_req_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput(error=str(exc)),
-                    )
 
+                # Mark as executing so other callers wait at the top of the
+                # loop, but collective_rpc can still acquire _rpc_lock.
+                self._executing = True
+
+            # Execute outside the lock so collective_rpc is not blocked.
+            exec_start = time.perf_counter()
+            try:
+                runner_output = self.execute_fn(sched_output)
+            except EngineDeadError:
+                with self._exec_cond:
+                    self._executing = False
+                    self._exec_cond.notify_all()
+                raise
+            except Exception as exc:
+                logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
+                runner_output = RunnerOutput(
+                    req_id=sched_req_id,
+                    step_index=None,
+                    finished=True,
+                    result=DiffusionOutput(error=str(exc)),
+                )
+
+            exec_ms = (time.perf_counter() - exec_start) * 1000
+            logger.debug("execute_fn completed in %.2f ms (lock released during execution)", exec_ms)
+
+            with self._exec_cond:
+                self._executing = False
+                self._exec_cond.notify_all()
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
@@ -473,6 +501,7 @@ class DiffusionEngine:
 
         deadline = None if timeout is None else time.monotonic() + timeout
         acquired = False
+        lock_wait_start = time.perf_counter()
         try:
             if deadline is None:
                 self._rpc_lock.acquire()
@@ -480,8 +509,10 @@ class DiffusionEngine:
             else:
                 lock_timeout = max(0, deadline - time.monotonic())
                 acquired = self._rpc_lock.acquire(timeout=lock_timeout)
+            lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
             if not acquired:
                 raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+            logger.debug("collective_rpc(%s) acquired lock in %.2f ms", method, lock_wait_ms)
 
             rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
             if deadline is not None and rpc_timeout <= 0:
