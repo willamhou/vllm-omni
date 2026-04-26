@@ -129,6 +129,231 @@ class TestConditionBasedLock:
 
         assert not concurrent_detected.is_set(), "Concurrent execution detected — _executing flag failed"
 
+    def test_engine_dead_error_clears_executing_flag(self) -> None:
+        """If execute_fn raises an EngineDeadError-like exception, the
+        executing flag must be cleared and waiters notified before the
+        exception propagates. Otherwise a second caller waiting on
+        cond.wait() would deadlock forever."""
+
+        class FakeEngineDeadError(Exception):
+            pass
+
+        lock = threading.RLock()
+        cond = threading.Condition(lock)
+        executing = False
+        waiter_unblocked = threading.Event()
+        captured: list[BaseException] = []
+
+        def dying_caller():
+            nonlocal executing
+            with cond:
+                while executing:
+                    cond.wait()
+                executing = True
+            try:
+                # execute_fn surrogate that signals engine death
+                raise FakeEngineDeadError("engine died mid-flight")
+            except FakeEngineDeadError:
+                with cond:
+                    executing = False
+                    cond.notify_all()
+                raise
+
+        def waiter():
+            nonlocal executing
+            with cond:
+                while executing:
+                    cond.wait()
+            waiter_unblocked.set()
+
+        def run_dying():
+            try:
+                dying_caller()
+            except FakeEngineDeadError as exc:
+                captured.append(exc)
+
+        t1 = threading.Thread(target=run_dying)
+        t1.start()
+        time.sleep(0.02)  # ensure t1 sets executing=True first
+        t2 = threading.Thread(target=waiter)
+        t2.start()
+
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+
+        assert captured, "FakeEngineDeadError should propagate to the caller"
+        assert waiter_unblocked.is_set(), (
+            "Waiter must be unblocked after engine dies; otherwise the "
+            "_executing flag deadlocks all subsequent callers"
+        )
+
+    def test_source_engine_dead_clears_executing(self) -> None:
+        """AST check: the EngineDeadError handler in
+        add_req_and_wait_for_response must clear _executing and call
+        notify_all() before re-raising, otherwise the rebased PR
+        introduces a deadlock when engine dies mid-execution."""
+        import ast
+        import os
+
+        engine_path = os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                os.pardir,
+                os.pardir,
+                "vllm_omni",
+                "diffusion",
+                "diffusion_engine.py",
+            )
+        )
+        with open(engine_path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+        target_func = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "DiffusionEngine":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "add_req_and_wait_for_response":
+                        target_func = item
+                        break
+        assert target_func is not None, "add_req_and_wait_for_response not found"
+
+        for handler in ast.walk(target_func):
+            if not isinstance(handler, ast.ExceptHandler):
+                continue
+            exc_type = handler.type
+            if not (isinstance(exc_type, ast.Name) and exc_type.id == "EngineDeadError"):
+                continue
+            handler_src = ast.get_source_segment(source, handler) or ""
+            assert "_executing = False" in handler_src, (
+                "EngineDeadError handler must clear _executing flag before re-raising"
+            )
+            assert "notify_all" in handler_src, (
+                "EngineDeadError handler must notify_all() before re-raising"
+            )
+            return
+        pytest.fail("EngineDeadError handler missing in add_req_and_wait_for_response")
+
+    def test_integration_real_path_no_duplicate_execute(self) -> None:
+        """Integration test invoking the real add_req_and_wait_for_response
+        on a DiffusionEngine instance (constructed via __new__ to bypass
+        the heavy __init__) with a fake scheduler and sleep-based
+        execute_fn. Two concurrent callers must not invoke execute_fn
+        while another invocation is still in flight, and execute_fn must
+        run exactly once per request.
+
+        This addresses reviewer feedback that the previous tests only
+        verified the locking pattern in isolation and never exercised
+        the real method against a scheduler that re-yields running
+        requests."""
+        from types import SimpleNamespace
+
+        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+        class FakeScheduler:
+            def __init__(self) -> None:
+                self._counter = 0
+                self._waiting: list[str] = []
+                self._running: list[str] = []
+                self._lock = threading.Lock()
+
+            def add_request(self, request: object) -> str:
+                with self._lock:
+                    self._counter += 1
+                    req_id = f"req_{self._counter}"
+                    self._waiting.append(req_id)
+                    return req_id
+
+            def schedule(self) -> SimpleNamespace:
+                with self._lock:
+                    # Re-yield in-flight running request if any (this is
+                    # exactly the behaviour reviewer warned about).
+                    if not self._running and self._waiting:
+                        self._running.append(self._waiting.pop(0))
+                    if self._running:
+                        return SimpleNamespace(
+                            is_empty=False,
+                            scheduled_req_ids=[self._running[0]],
+                            finished_req_ids=[],
+                        )
+                    return SimpleNamespace(
+                        is_empty=True,
+                        scheduled_req_ids=[],
+                        finished_req_ids=[],
+                    )
+
+            def update_from_output(self, sched_output: SimpleNamespace, runner_output: SimpleNamespace) -> list[str]:
+                with self._lock:
+                    req_id = sched_output.scheduled_req_ids[0]
+                    if req_id in self._running:
+                        self._running.remove(req_id)
+                    return [req_id]
+
+            def has_requests(self) -> bool:
+                with self._lock:
+                    return bool(self._waiting or self._running)
+
+            def get_request_state(self, sched_req_id: str) -> SimpleNamespace:
+                return SimpleNamespace()
+
+            def pop_request_state(self, sched_req_id: str) -> SimpleNamespace:
+                return SimpleNamespace()
+
+            def get_sched_req_id(self, request_id: str) -> None:
+                return None
+
+        active = {"count": 0, "max": 0, "calls": 0}
+        active_lock = threading.Lock()
+
+        def slow_execute(sched_output: SimpleNamespace) -> SimpleNamespace:
+            with active_lock:
+                active["count"] += 1
+                active["calls"] += 1
+                if active["count"] > active["max"]:
+                    active["max"] = active["count"]
+            try:
+                time.sleep(0.15)
+            finally:
+                with active_lock:
+                    active["count"] -= 1
+            return SimpleNamespace(
+                req_id=sched_output.scheduled_req_ids[0],
+                step_index=None,
+                finished=True,
+                result=SimpleNamespace(),
+            )
+
+        engine = object.__new__(DiffusionEngine)
+        engine._rpc_lock = threading.RLock()
+        engine._exec_cond = threading.Condition(engine._rpc_lock)
+        engine._executing = False
+        engine.scheduler = FakeScheduler()
+        engine.execute_fn = slow_execute
+        engine._process_aborts_queue = lambda: None
+        engine._finalize_finished_request = lambda sched_req_id, **kw: SimpleNamespace(req_id=sched_req_id)
+
+        fake_request = SimpleNamespace()
+        results: list[object] = []
+        results_lock = threading.Lock()
+
+        def caller() -> None:
+            out = engine.add_req_and_wait_for_response(fake_request)
+            with results_lock:
+                results.append(out)
+
+        t1 = threading.Thread(target=caller)
+        t2 = threading.Thread(target=caller)
+        t1.start()
+        time.sleep(0.01)
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert not t1.is_alive() and not t2.is_alive(), "Threads deadlocked"
+        assert active["calls"] == 2, f"Expected execute_fn called twice, got {active['calls']}"
+        assert active["max"] == 1, f"Concurrent execute_fn detected (max in flight={active['max']})"
+        assert len(results) == 2, f"Expected 2 results, got {len(results)}"
+
     def test_source_uses_exec_cond(self) -> None:
         """Verify add_req_and_wait_for_response uses _exec_cond (Condition)
         and _executing flag, not a single wrapping _rpc_lock."""
