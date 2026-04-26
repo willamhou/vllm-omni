@@ -183,8 +183,7 @@ class TestConditionBasedLock:
 
         assert captured, "FakeEngineDeadError should propagate to the caller"
         assert waiter_unblocked.is_set(), (
-            "Waiter must be unblocked after engine dies; otherwise the "
-            "_executing flag deadlocks all subsequent callers"
+            "Waiter must be unblocked after engine dies; otherwise the _executing flag deadlocks all subsequent callers"
         )
 
     def test_source_engine_dead_clears_executing(self) -> None:
@@ -228,9 +227,7 @@ class TestConditionBasedLock:
             assert "_executing = False" in handler_src, (
                 "EngineDeadError handler must clear _executing flag before re-raising"
             )
-            assert "notify_all" in handler_src, (
-                "EngineDeadError handler must notify_all() before re-raising"
-            )
+            assert "notify_all" in handler_src, "EngineDeadError handler must notify_all() before re-raising"
             return
         pytest.fail("EngineDeadError handler missing in add_req_and_wait_for_response")
 
