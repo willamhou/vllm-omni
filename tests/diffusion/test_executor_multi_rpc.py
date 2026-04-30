@@ -21,7 +21,9 @@ sequencing is:
 
 from __future__ import annotations
 
+import itertools
 import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +68,9 @@ def _make_executor(num_gpus: int = 1):
     executor._processes = []
     executor.is_failed = False
     executor._failure_callbacks = []
+    # Mirror state that ``_init_executor`` would normally populate.
+    executor._cid_counter = itertools.count(1)
+    executor._cid_lock = threading.Lock()
     return executor, req_q, res_q
 
 
@@ -76,14 +81,50 @@ class TestCorrelationIDs:
     def test_correlation_id_is_monotonic_and_unique(self) -> None:
         """1k sequential RPCs produce strictly increasing correlation IDs
         with no duplicates and no gaps under normal flow."""
-        pytest.skip("Step 2: envelope + correlation IDs not yet implemented")
+        executor, req_q, res_q = _make_executor()
+
+        n = 1000
+        cids: list[int] = []
+
+        def fake_worker():
+            for _ in range(n):
+                req = req_q.get(timeout=10)
+                cid = req["correlation_id"]
+                cids.append(cid)
+                # Echo back as proper rpc_reply envelope
+                res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output(f"r{cid}")})
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        for _ in range(n):
+            executor.collective_rpc("ping", unique_reply_rank=0)
+
+        worker.join(timeout=10)
+        assert cids == sorted(cids), "correlation_ids must be monotonically increasing"
+        assert len(set(cids)) == n, "correlation_ids must be unique"
+        assert cids[-1] - cids[0] == n - 1, "no gaps expected for sequential calls"
 
     def test_backward_compat_reply_without_correlation_id_routed_to_oldest(self) -> None:
-        """A bare reply (no envelope) must route to the oldest PENDING
-        correlation_id — preserving single-flight semantics for legacy
-        senders. Codex Q2 verified this is correct because
-        WorkerProc.return_result is single-threaded and rank-0 only."""
-        pytest.skip("Step 2: backward-compat fallback not yet implemented")
+        """A bare reply (no envelope) must still satisfy the in-flight
+        single-flight call. Codex Q2 verified this is correct because
+        WorkerProc.return_result is single-threaded and rank-0 only, so
+        legacy untagged replies remain single-source FIFO."""
+        executor, req_q, res_q = _make_executor()
+
+        def fake_worker():
+            req_q.get(timeout=10)
+            # Reply WITHOUT envelope (legacy worker path / add_req path)
+            res_q.put(_tagged_output("legacy"))
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        result = executor.collective_rpc("ping", unique_reply_rank=0)
+        worker.join(timeout=5)
+
+        assert isinstance(result, DiffusionOutput)
+        assert result.error == "legacy", "legacy untagged reply must be returned to caller"
 
 
 # ───────────────────────── Step 3: sender-driven demux ────────────────────────

@@ -569,18 +569,31 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: Any):
-        """Reply to client, only on rank 0."""
-        if self.result_mq is not None:
-            if isinstance(output, OmniACK):
-                self.result_mq.enqueue(output)
-                return
+    def return_result(self, output: Any, correlation_id: int | None = None):
+        """Reply to client, only on rank 0.
+
+        When ``correlation_id`` is provided (collective_rpc path), the
+        reply is wrapped in an ``rpc_reply`` envelope so the executor's
+        sender-driven demux (RFC #3158 Step A) can route it to the
+        correct waiter. Untagged replies (add_req path) bypass the
+        envelope and go through unchanged for backward compatibility.
+        """
+        if self.result_mq is None:
+            return
+        if isinstance(output, OmniACK):
+            payload: Any = output
+        else:
             try:
                 pack_diffusion_output_shm(output)
             except Exception as e:
                 if hasattr(output, "output"):
                     logger.warning("SHM pack failed for model output: %s", e)
-            self.result_mq.enqueue(output)
+            payload = output
+
+        if correlation_id is not None:
+            self.result_mq.enqueue({"type": "rpc_reply", "correlation_id": correlation_id, "payload": payload})
+        else:
+            self.result_mq.enqueue(payload)
 
     def recv_message(self):
         """Receive messages from broadcast queue."""
@@ -640,14 +653,15 @@ class WorkerProc:
                 self.return_result(ack)
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
+                cid = msg.get("correlation_id")
                 try:
                     result, should_reply = self.execute_rpc(msg)
                     if should_reply:
-                        self.return_result(result)
+                        self.return_result(result, correlation_id=cid)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        self.return_result(DiffusionOutput(error=str(e)), correlation_id=cid)
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

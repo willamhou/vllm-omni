@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import multiprocessing as mp
 import multiprocessing.connection
 import threading
@@ -14,7 +15,7 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -69,6 +70,18 @@ class BackgroundResources:
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
+
+    def __init__(self, od_config: OmniDiffusionConfig) -> None:
+        # Monotonic correlation_id stamped on every collective_rpc broadcast
+        # envelope. Workers echo it back inside the reply envelope so that
+        # the upcoming sender-driven demux (RFC #3158 Step A) can route
+        # replies among concurrent callers. add_req() does not stamp a cid
+        # because it shares _result_mq under the engine-level _rpc_lock.
+        # Initialised before ``_init_executor`` so test fixtures that
+        # monkeypatch ``_init_executor`` still inherit the counter state.
+        self._cid_counter = itertools.count(1)
+        self._cid_lock = threading.Lock()
+        super().__init__(od_config)
 
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
@@ -328,6 +341,30 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         else:
             raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def _next_cid(self) -> int:
+        """Return a monotonic correlation_id for the next collective_rpc.
+
+        Falls back to lazy initialisation so legacy test fixtures that
+        bypass ``__init__`` via ``object.__new__`` still work.
+        """
+        if not hasattr(self, "_cid_lock"):
+            self._cid_lock = threading.Lock()
+            self._cid_counter = itertools.count(1)
+        with self._cid_lock:
+            return next(self._cid_counter)
+
+    @staticmethod
+    def _unwrap_reply(response: Any) -> tuple[Any, int | None]:
+        """Strip the rpc_reply envelope if present.
+
+        Returns ``(payload, correlation_id)``. Legacy untagged replies
+        (from add_req or pre-Step-A workers) come through unchanged with
+        ``correlation_id=None``.
+        """
+        if isinstance(response, dict) and response.get("type") == "rpc_reply":
+            return response.get("payload"), response.get("correlation_id")
+        return response, None
+
     def collective_rpc(
         self,
         method: str,
@@ -341,6 +378,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
+        cid = self._next_cid()
 
         # Prepare RPC request message
         # When unique_reply_rank is None, all workers must execute the RPC
@@ -352,6 +390,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "kwargs": kwargs,
             "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
             "exec_all_ranks": unique_reply_rank is None or exec_all_ranks,
+            "correlation_id": cid,
         }
 
         try:
@@ -364,6 +403,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             responses = []
             for _ in range(num_responses):
                 response = self._dequeue_one_with_failure_polling(deadline, method)
+                response, _ = self._unwrap_reply(response)
 
                 try:
                     unpack_diffusion_output_shm(response)
