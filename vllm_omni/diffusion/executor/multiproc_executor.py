@@ -29,6 +29,10 @@ logger = init_logger(__name__)
 
 _DEQUEUE_TIMEOUT_S = 5.0
 
+# Sentinel returned by ``_dequeue_one_chunk`` when the timeout elapses
+# without a message and the executor has not yet observed worker death.
+_DEQUEUE_NOTHING: Any = object()
+
 
 @dataclass
 class BackgroundResources:
@@ -72,16 +76,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        # Monotonic correlation_id stamped on every collective_rpc broadcast
-        # envelope. Workers echo it back inside the reply envelope so that
-        # the upcoming sender-driven demux (RFC #3158 Step A) can route
-        # replies among concurrent callers. add_req() does not stamp a cid
-        # because it shares _result_mq under the engine-level _rpc_lock.
-        # Initialised before ``_init_executor`` so test fixtures that
-        # monkeypatch ``_init_executor`` still inherit the counter state.
-        self._cid_counter = itertools.count(1)
-        self._cid_lock = threading.Lock()
+        # Initialise the sender-driven demux state (RFC #3158 Step A)
+        # before ``_init_executor`` so test fixtures that monkeypatch
+        # ``_init_executor`` still inherit usable dispatcher state.
+        self._ensure_dispatch_state()
         super().__init__(od_config)
+
+    def _ensure_dispatch_state(self) -> None:
+        """Idempotently set up correlation_id + sender-driven demux state.
+
+        Tolerates fixtures that build the executor via ``object.__new__``
+        and never call ``__init__``; ``collective_rpc`` invokes this at
+        the head of every call so test setup remains uniform.
+        """
+        if not hasattr(self, "_cid_lock"):
+            self._cid_lock = threading.Lock()
+            self._cid_counter = itertools.count(1)
+        if not hasattr(self, "_dispatch_lock"):
+            self._dispatch_lock = threading.Lock()
+            self._dispatch_cond = threading.Condition(self._dispatch_lock)
+            self._dequeue_lock = threading.Lock()
+            self._pending: set[int] = set()
+            self._inbox: dict[int, Any] = {}
 
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
@@ -342,14 +358,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def _next_cid(self) -> int:
-        """Return a monotonic correlation_id for the next collective_rpc.
-
-        Falls back to lazy initialisation so legacy test fixtures that
-        bypass ``__init__`` via ``object.__new__`` still work.
-        """
-        if not hasattr(self, "_cid_lock"):
-            self._cid_lock = threading.Lock()
-            self._cid_counter = itertools.count(1)
+        """Return a monotonic correlation_id for the next collective_rpc."""
         with self._cid_lock:
             return next(self._cid_counter)
 
@@ -365,6 +374,33 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return response.get("payload"), response.get("correlation_id")
         return response, None
 
+    def _dequeue_one_chunk(self, timeout: float) -> Any:
+        """Single-chunk dequeue used by the sender-driven demux loop.
+
+        Returns the dequeued message, or ``_DEQUEUE_NOTHING`` if the
+        timeout elapsed without a message; raises ``EngineDeadError`` if
+        worker death is observed during the wait.
+        """
+        try:
+            return self._result_mq.dequeue(timeout=timeout)
+        except (TimeoutError, zmq.error.Again):
+            if self.is_failed:
+                raise EngineDeadError() from None
+            return _DEQUEUE_NOTHING
+
+    def _finalize_response(self, response: Any) -> Any:
+        """Common post-processing for collective_rpc replies."""
+        try:
+            unpack_diffusion_output_shm(response)
+        except Exception as e:
+            logger.warning("SHM unpack failed (data may already be inline): %s", e)
+        if isinstance(response, dict) and response.get("status") == "error":
+            raise RuntimeError(
+                f"Worker failed with error '{response.get('error')}', "
+                "please check the stack trace above for the root cause"
+            )
+        return response
+
     def collective_rpc(
         self,
         method: str,
@@ -374,13 +410,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         unique_reply_rank: int | None = None,
         exec_all_ranks: bool = False,
     ) -> Any:
+        """Sender-driven dispatch of an RPC across the worker pool.
+
+        Concurrent callers correlate replies via ``correlation_id``: at
+        most one caller drains ``_result_mq`` at a time (guarded by
+        ``_dequeue_lock``), and any reply not addressed to the dequeuer
+        is parked in ``_inbox`` for the true owner. Off-duty callers
+        wait on ``_dispatch_cond`` until a peer stashes their reply.
+        See RFC #3158 Step A.
+        """
         self._ensure_open()
+        self._ensure_dispatch_state()
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
         cid = self._next_cid()
 
-        # Prepare RPC request message
         # When unique_reply_rank is None, all workers must execute the RPC
         # but only rank 0 can reply (it's the only one with a result_mq).
         rpc_request = {
@@ -393,36 +438,82 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "correlation_id": cid,
         }
 
+        with self._dispatch_lock:
+            self._pending.add(cid)
+
+        def _wrap(payload: Any) -> Any:
+            """Preserve the legacy contract: ``unique_reply_rank=None``
+            callers receive a list (rank 0 still produces only one
+            reply); a specific rank caller receives the payload as-is.
+            """
+            result = self._finalize_response(payload)
+            return result if unique_reply_rank is not None else [result]
+
         try:
-            # Broadcast RPC request to all workers via unified message queue
             self._broadcast_mq.enqueue(rpc_request)
 
-            # Only rank 0 has a result_mq, so we always expect exactly 1 response
-            num_responses = 1
+            while True:
+                # 1) inbox fast path: somebody else may have stashed our reply
+                with self._dispatch_lock:
+                    if cid in self._inbox:
+                        return _wrap(self._inbox.pop(cid))
 
-            responses = []
-            for _ in range(num_responses):
-                response = self._dequeue_one_with_failure_polling(deadline, method)
-                response, _ = self._unwrap_reply(response)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(f"RPC call to {method} timed out.")
 
-                try:
-                    unpack_diffusion_output_shm(response)
-                except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                # 2) try to acquire the dequeue role
+                lock_timeout = remaining if remaining is not None else 0.5
+                if self._dequeue_lock.acquire(timeout=lock_timeout):
+                    try:
+                        # re-check inbox after winning the role; a peer may
+                        # have stashed our reply while we were contending
+                        with self._dispatch_lock:
+                            if cid in self._inbox:
+                                return _wrap(self._inbox.pop(cid))
 
-                # Check if response indicates an error
-                if isinstance(response, dict) and response.get("status") == "error":
-                    raise RuntimeError(
-                        f"Worker failed with error '{response.get('error')}', "
-                        "please check the stack trace above for the root cause"
-                    )
+                        chunk = _DEQUEUE_TIMEOUT_S
+                        if remaining is not None:
+                            chunk = min(chunk, max(0.0, deadline - time.monotonic()))
+                        if chunk <= 0:
+                            raise TimeoutError(f"RPC call to {method} timed out.")
 
-                responses.append(response)
+                        response = self._dequeue_one_chunk(chunk)
+                        if response is _DEQUEUE_NOTHING:
+                            continue
 
-            return responses[0] if unique_reply_rank is not None else responses
-        except Exception as e:
-            logger.error(f"RPC call failed: {e}")
-            raise
+                        payload, msg_cid = self._unwrap_reply(response)
+                        # Backward-compat: untagged legacy reply routes to
+                        # the oldest pending cid (single-flight fallback).
+                        if msg_cid is None:
+                            with self._dispatch_lock:
+                                msg_cid = min(self._pending) if self._pending else None
+
+                        if msg_cid == cid:
+                            return _wrap(payload)
+
+                        with self._dispatch_cond:
+                            if msg_cid is not None and msg_cid in self._pending:
+                                self._inbox[msg_cid] = payload
+                                self._dispatch_cond.notify_all()
+                            else:
+                                logger.warning("dropping reply for unknown correlation_id=%s", msg_cid)
+                    finally:
+                        self._dequeue_lock.release()
+                else:
+                    # 3) couldn't be the dequeuer; wait for a peer to stash
+                    with self._dispatch_cond:
+                        if cid in self._inbox:
+                            return _wrap(self._inbox.pop(cid))
+                        wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+                        if wait is not None and wait <= 0:
+                            raise TimeoutError(f"RPC call to {method} timed out.")
+                        self._dispatch_cond.wait(timeout=wait)
+        finally:
+            with self._dispatch_lock:
+                self._pending.discard(cid)
+                # GC any reply that landed for us after we gave up.
+                self._inbox.pop(cid, None)
 
     def check_health(self) -> None:
         self._ensure_open()

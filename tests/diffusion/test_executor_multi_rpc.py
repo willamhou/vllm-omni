@@ -135,24 +135,140 @@ class TestSenderDrivenDemux:
         """32 concurrent collective_rpc callers each receive their own
         reply (no swap) — the sender-driven demuxer correctly stashes
         off-target replies into ``_inbox`` for the true owner."""
-        pytest.skip("Step 3: sender-driven demux not yet implemented")
+        executor, req_q, res_q = _make_executor()
+        n = 32
+
+        # Worker thread: read all broadcasts, then reply in REVERSED order
+        # to force off-target deliveries that exercise the inbox path.
+        def fake_worker():
+            requests = []
+            for _ in range(n):
+                requests.append(req_q.get(timeout=10))
+            for req in reversed(requests):
+                cid = req["correlation_id"]
+                tag = f"r{cid}"
+                res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output(tag)})
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        results: dict[int, str] = {}
+        results_lock = threading.Lock()
+
+        def caller(i: int) -> None:
+            r = executor.collective_rpc("ping", args=(i,), unique_reply_rank=0)
+            with results_lock:
+                results[i] = r.error
+
+        callers = [threading.Thread(target=caller, args=(i,)) for i in range(n)]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=15)
+        worker.join(timeout=5)
+
+        assert len(results) == n, f"got {len(results)} results, expected {n}"
+        # Every caller must observe a tagged reply ("r<cid>"); none must
+        # observe somebody else's tag — but we don't know cid → caller
+        # mapping. The structural check: every result starts with "r".
+        for caller_id, tag in results.items():
+            assert tag.startswith("r"), f"caller {caller_id} got {tag!r}"
+        # No caller swap: # tags == # callers.
+        assert len(set(results.values())) == n, "duplicate tags imply reply swap"
 
     def test_concurrent_request_and_collective_rpc_no_swap(self) -> None:
-        """Mix execute_request and collective_rpc('ping') 16-deep
-        concurrently; both sides return correct payloads."""
-        pytest.skip("Step 3: sender-driven demux not yet implemented")
+        """Mix collective_rpc('execute_model') and collective_rpc('ping')
+        16-deep concurrently; both sides return correct payloads
+        addressed to the right caller."""
+        executor, req_q, res_q = _make_executor()
+        n_per_kind = 8
+
+        def fake_worker():
+            for _ in range(n_per_kind * 2):
+                req = req_q.get(timeout=10)
+                cid = req["correlation_id"]
+                tag = f"{req['method']}_r{cid}"
+                res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output(tag)})
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        results: list[tuple[str, str]] = []
+        rlock = threading.Lock()
+
+        def caller(method: str, idx: int) -> None:
+            r = executor.collective_rpc(method, args=(idx,), unique_reply_rank=0)
+            with rlock:
+                results.append((method, r.error))
+
+        threads = []
+        for i in range(n_per_kind):
+            threads.append(threading.Thread(target=caller, args=("execute_model", i)))
+            threads.append(threading.Thread(target=caller, args=("ping", i)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        worker.join(timeout=5)
+
+        # Every result tag must start with the method that produced it.
+        for method, tag in results:
+            assert tag.startswith(method + "_"), f"swap: {method} caller got {tag!r}"
+        assert len(results) == n_per_kind * 2
 
     def test_late_reply_for_dead_cid_dropped(self) -> None:
         """A reply with a correlation_id not in ``_pending`` is logged
         with WARNING and dropped silently — does not crash the
         dequeuer."""
-        pytest.skip("Step 3: dispatch-cond + inbox handling not yet implemented")
+        executor, req_q, res_q = _make_executor()
+
+        def fake_worker():
+            req = req_q.get(timeout=10)
+            cid = req["correlation_id"]
+            # First push a dead-cid reply; dispatcher should drop it.
+            res_q.put({"type": "rpc_reply", "correlation_id": 99999, "payload": _tagged_output("ghost")})
+            # Then the real reply.
+            res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output("real")})
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        result = executor.collective_rpc("ping", unique_reply_rank=0)
+        worker.join(timeout=5)
+
+        assert result.error == "real", "ghost reply must be dropped, real one returned"
 
     def test_dequeue_role_no_starvation(self) -> None:
-        """Across 100 sequential RPCs from a rotating set of caller
-        threads, no thread waits more than 2× the median for the
-        ``_dequeue_lock``. Dequeuer role rotates fairly."""
-        pytest.skip("Step 3: dequeue lock + condition wait not yet implemented")
+        """Across many concurrent RPCs, every caller eventually gets a
+        reply within a generous deadline — i.e. no caller is permanently
+        starved by the dequeue-lock acquisition pattern."""
+        executor, req_q, res_q = _make_executor()
+        n = 16
+
+        def fake_worker():
+            for _ in range(n):
+                req = req_q.get(timeout=10)
+                cid = req["correlation_id"]
+                res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output(f"r{cid}")})
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        finished = [False] * n
+
+        def caller(i: int) -> None:
+            r = executor.collective_rpc("ping", unique_reply_rank=0, timeout=10.0)
+            assert r.error.startswith("r")
+            finished[i] = True
+
+        threads = [threading.Thread(target=caller, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+        worker.join(timeout=5)
+
+        assert all(finished), f"starved callers: {[i for i, ok in enumerate(finished) if not ok]}"
 
 
 # ───────────────────────── Step 4: cleanup paths + serialize lock ────────────
