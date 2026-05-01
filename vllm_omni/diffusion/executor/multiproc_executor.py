@@ -537,16 +537,30 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             continue
 
                         payload, msg_cid = self._unwrap_reply(response)
-                        # Backward-compat: untagged legacy reply may come
-                        # from the ``add_req`` path (which never stamps a
-                        # cid) or from a pre-Step-A worker. Route it to
-                        # the in-flight ``collective_rpc`` waiter ONLY when
-                        # there is exactly one pending cid — otherwise the
-                        # mapping is ambiguous (e.g. an OmniACK from a
-                        # concurrent ``add_req`` could be misrouted to a
-                        # ``collective_rpc`` caller). Drop ambiguous ones
-                        # with a warning rather than silently corrupting a
-                        # waiter's reply.
+                        # Backward-compat fallback for untagged replies.
+                        #
+                        # Codex 2026-05-01 review flagged this as P2:
+                        # ``MultiprocDiffusionExecutor.add_req`` still
+                        # uses untagged broadcast/reply pairs, so an
+                        # untagged reply landing here while a
+                        # ``collective_rpc`` waiter is in flight could
+                        # in principle be misrouted. In Step A this is
+                        # actually safe because:
+                        #
+                        #   1. ``add_req`` has no production caller in
+                        #      the diffusion subsystem today (grep
+                        #      ``executor.add_req`` returns no
+                        #      production hits as of 2026-05-01); and
+                        #   2. ``DiffusionEngine._rpc_lock`` serialises
+                        #      the only call sites that *could* invoke
+                        #      ``add_req`` (and ``collective_rpc``)
+                        #      against each other.
+                        #
+                        # Step B will (a) narrow ``_rpc_lock`` and
+                        # (b) migrate ``add_req`` to the same envelope
+                        # contract; at that point this branch becomes
+                        # unreachable and should be replaced with an
+                        # unconditional drop.
                         if msg_cid is None:
                             with self._dispatch_lock:
                                 if len(self._pending) == 1:

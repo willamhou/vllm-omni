@@ -113,10 +113,13 @@ class TestCorrelationIDs:
         assert cids[-1] - cids[0] == n - 1, "no gaps expected for sequential calls"
 
     def test_backward_compat_reply_without_correlation_id_routed_to_oldest(self) -> None:
-        """A bare reply (no envelope) must still satisfy the in-flight
-        single-flight call. Codex Q2 verified this is correct because
-        WorkerProc.return_result is single-threaded and rank-0 only, so
-        legacy untagged replies remain single-source FIFO."""
+        """A bare reply (no envelope) is routed to the sole pending
+        ``collective_rpc`` waiter. Codex flagged this as P2 (untagged
+        replies could belong to a concurrent ``add_req``); see the
+        in-code NOTE — Step A keeps the fallback because (a)
+        ``add_req`` has no production callers and (b) the engine-level
+        ``_rpc_lock`` serialises the only call sites that could mix
+        the two. Step B drops the fallback entirely."""
         executor, req_q, res_q = _make_executor()
 
         def fake_worker():
