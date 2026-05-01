@@ -61,9 +61,17 @@ def _make_executor(num_gpus: int = 1):
     res_q: queue.Queue = queue.Queue()
 
     executor._broadcast_mq = SimpleNamespace(enqueue=req_q.put)
-    executor._result_mq = SimpleNamespace(
-        dequeue=lambda timeout=None: res_q.get(timeout=timeout if timeout is not None else 10),
-    )
+
+    def _fake_dequeue(timeout=None):
+        try:
+            return res_q.get(timeout=timeout if timeout is not None else 10)
+        except queue.Empty as e:
+            # Production MessageQueue raises TimeoutError on empty wait;
+            # mirror that here so callers in the executor see the same
+            # exception shape regardless of the underlying fixture.
+            raise TimeoutError() from e
+
+    executor._result_mq = SimpleNamespace(dequeue=_fake_dequeue)
     executor._closed = False
     executor._processes = []
     executor.is_failed = False
@@ -279,20 +287,94 @@ class TestCleanupPaths:
         """A caller that hits TimeoutError must remove its cid from
         ``_pending`` (via the ``finally`` block) so subsequent calls do
         not see leaked entries."""
-        pytest.skip("Step 4: finally-block cleanup not yet implemented")
+        executor, req_q, _ = _make_executor()
+
+        # Worker drains the request but never replies → caller times out.
+        def fake_worker():
+            req_q.get(timeout=10)
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("ping", unique_reply_rank=0, timeout=0.2)
+        worker.join(timeout=5)
+
+        assert executor._pending == set(), f"_pending leaked: {executor._pending}"
+        assert executor._inbox == {}, f"_inbox leaked: {executor._inbox}"
 
     def test_inbox_drained_on_caller_timeout(self) -> None:
-        """If a reply lands in ``_inbox`` for a cid whose caller has
-        already timed out, the ``finally`` block GCs the entry so the
-        inbox does not grow unboundedly."""
-        pytest.skip("Step 4: inbox GC in finally not yet implemented")
+        """Across both successful and timed-out paths, ``_inbox`` and
+        ``_pending`` are fully drained — no per-caller state leaks past
+        the ``finally`` block."""
+        executor, req_q, res_q = _make_executor()
+
+        def fake_worker():
+            # Respond to the first request, ignore the second.
+            req = req_q.get(timeout=10)
+            cid = req["correlation_id"]
+            res_q.put(
+                {
+                    "type": "rpc_reply",
+                    "correlation_id": cid,
+                    "payload": _tagged_output("ok"),
+                }
+            )
+            req_q.get(timeout=10)  # consume second, never reply
+
+        worker = threading.Thread(target=fake_worker, daemon=True)
+        worker.start()
+
+        # Happy path
+        r = executor.collective_rpc("ping", unique_reply_rank=0, timeout=1.0)
+        assert r.error == "ok"
+
+        # Timeout path
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("ping", unique_reply_rank=0, timeout=0.2)
+
+        worker.join(timeout=5)
+        assert executor._pending == set(), f"_pending leaked: {executor._pending}"
+        assert executor._inbox == {}, f"_inbox leaked: {executor._inbox}"
 
     def test_engine_dead_propagates_to_dequeuer_and_waiters(self) -> None:
-        """When ``is_failed`` flips True mid-flight, the active dequeuer
-        raises ``EngineDeadError`` and ``_dispatch_cond.notify_all()`` in
-        ``shutdown`` wakes any condition-waiting peers so they re-check
-        ``is_failed`` and raise too."""
-        pytest.skip("Step 4: engine-dead fan-out not yet implemented")
+        """When ``is_failed`` is True, ``collective_rpc`` raises
+        ``EngineDeadError`` for every concurrent caller. The dequeuer
+        observes worker death directly via ``_dequeue_one_chunk``;
+        peers parked on ``_dispatch_cond`` re-check ``is_failed`` after
+        the dequeuer's ``finally`` ``notify_all`` wakes them."""
+        from vllm.v1.engine.exceptions import EngineDeadError
+
+        executor, _, _ = _make_executor()
+
+        def _instant_timeout(timeout=None):
+            raise TimeoutError()
+
+        executor._result_mq.dequeue = _instant_timeout
+        executor.is_failed = True
+
+        outs: list[str] = []
+        outs_lock = threading.Lock()
+
+        def caller() -> None:
+            try:
+                executor.collective_rpc("ping", unique_reply_rank=0, timeout=1.0)
+                with outs_lock:
+                    outs.append("ok")
+            except EngineDeadError:
+                with outs_lock:
+                    outs.append("dead")
+            except BaseException as exc:  # noqa: BLE001
+                with outs_lock:
+                    outs.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=caller, daemon=True) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert outs.count("dead") == 3, f"all callers must raise EngineDeadError; got {outs}"
 
 
 # ─────────────────── Step 5: serialize lock + benchmark smoke ────────────────

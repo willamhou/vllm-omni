@@ -33,6 +33,13 @@ _DEQUEUE_TIMEOUT_S = 5.0
 # without a message and the executor has not yet observed worker death.
 _DEQUEUE_NOTHING: Any = object()
 
+# Methods that mutate worker GPU memory residency and therefore cannot
+# safely interleave with an in-flight ``execute_model``. Step A ships a
+# placeholder constant; Step B will replace this with a per-RPC
+# annotation system (see RFC #3158, 2026-04-27 comment, deferred LoRA
+# debate).
+_NON_INTERLEAVABLE_METHODS: frozenset[str] = frozenset({"sleep", "wake_up", "handle_sleep_task", "handle_wake_task"})
+
 
 @dataclass
 class BackgroundResources:
@@ -98,6 +105,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._dequeue_lock = threading.Lock()
             self._pending: set[int] = set()
             self._inbox: dict[int, Any] = {}
+        if not hasattr(self, "_serialize_lock"):
+            # Gates ``_NON_INTERLEAVABLE_METHODS`` against each other and
+            # against in-flight RPCs that hold it; this is the plug point
+            # Step B's annotation system will replace.
+            self._serialize_lock = threading.Lock()
 
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
@@ -422,6 +434,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         self._ensure_dispatch_state()
 
+        # Non-interleavable methods (sleep / wake_up / ...) mutate worker
+        # GPU memory residency, so they must serialise against everything
+        # else holding the executor. The annotation system is deferred to
+        # Step B; for now a literal frozenset gates the placeholder lock.
+        if method in _NON_INTERLEAVABLE_METHODS:
+            with self._serialize_lock:
+                return self._collective_rpc_inner(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
+        return self._collective_rpc_inner(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
+
+    def _collective_rpc_inner(
+        self,
+        method: str,
+        timeout: float | None,
+        args: tuple,
+        kwargs: dict | None,
+        unique_reply_rank: int | None,
+        exec_all_ranks: bool,
+    ) -> Any:
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
         cid = self._next_cid()
@@ -505,15 +535,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     with self._dispatch_cond:
                         if cid in self._inbox:
                             return _wrap(self._inbox.pop(cid))
+                        # Worker death observed by another caller's
+                        # dequeue chunk fans out via notify_all; honour
+                        # it here before sleeping again.
+                        if self.is_failed:
+                            raise EngineDeadError()
                         wait = None if deadline is None else max(0.0, deadline - time.monotonic())
                         if wait is not None and wait <= 0:
                             raise TimeoutError(f"RPC call to {method} timed out.")
                         self._dispatch_cond.wait(timeout=wait)
         finally:
-            with self._dispatch_lock:
+            # Drop our cid from _pending and GC any reply that landed
+            # after we gave up; notify peers in case our exit (timeout
+            # or EngineDeadError) is what they were waiting on.
+            with self._dispatch_cond:
                 self._pending.discard(cid)
-                # GC any reply that landed for us after we gave up.
                 self._inbox.pop(cid, None)
+                self._dispatch_cond.notify_all()
 
     def check_health(self) -> None:
         self._ensure_open()
@@ -526,6 +564,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def shutdown(self) -> None:
         self._closed = True
+        # Wake any callers parked on _dispatch_cond so they observe
+        # _closed / is_failed and bail out instead of blocking forever.
+        if hasattr(self, "_dispatch_cond"):
+            with self._dispatch_cond:
+                self._dispatch_cond.notify_all()
         try:
             self._finalizer()
         finally:
