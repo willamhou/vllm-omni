@@ -21,7 +21,6 @@ sequencing is:
 
 from __future__ import annotations
 
-import itertools
 import queue
 import threading
 from types import SimpleNamespace
@@ -76,9 +75,9 @@ def _make_executor(num_gpus: int = 1):
     executor._processes = []
     executor.is_failed = False
     executor._failure_callbacks = []
-    # Mirror state that ``_init_executor`` would normally populate.
-    executor._cid_counter = itertools.count(1)
-    executor._cid_lock = threading.Lock()
+    # ``_cid_counter`` / ``_dispatch_lock`` / ``_serialize_lock`` are
+    # already initialised by ``__init__`` -> ``_ensure_dispatch_state``
+    # which runs before ``_init_executor`` is monkeypatched away.
     return executor, req_q, res_q
 
 
@@ -142,7 +141,12 @@ class TestSenderDrivenDemux:
     def test_concurrent_collective_rpc_results_routed_correctly(self) -> None:
         """32 concurrent collective_rpc callers each receive their own
         reply (no swap) — the sender-driven demuxer correctly stashes
-        off-target replies into ``_inbox`` for the true owner."""
+        off-target replies into ``_inbox`` for the true owner.
+
+        The worker echoes the caller's ``args[0]`` in the reply tag so a
+        pair-swap (cid 1 receives cid 2's reply) would surface as a
+        wrong ``caller{i}`` prefix on caller ``i``.
+        """
         executor, req_q, res_q = _make_executor()
         n = 32
 
@@ -154,7 +158,8 @@ class TestSenderDrivenDemux:
                 requests.append(req_q.get(timeout=10))
             for req in reversed(requests):
                 cid = req["correlation_id"]
-                tag = f"r{cid}"
+                arg = req["args"][0]
+                tag = f"caller{arg}_r{cid}"
                 res_q.put({"type": "rpc_reply", "correlation_id": cid, "payload": _tagged_output(tag)})
 
         worker = threading.Thread(target=fake_worker, daemon=True)
@@ -176,12 +181,11 @@ class TestSenderDrivenDemux:
         worker.join(timeout=5)
 
         assert len(results) == n, f"got {len(results)} results, expected {n}"
-        # Every caller must observe a tagged reply ("r<cid>"); none must
-        # observe somebody else's tag — but we don't know cid → caller
-        # mapping. The structural check: every result starts with "r".
+        # Per-caller identity check catches both bulk and pair swaps:
+        # every caller must see a tag prefixed with its own caller id.
         for caller_id, tag in results.items():
-            assert tag.startswith("r"), f"caller {caller_id} got {tag!r}"
-        # No caller swap: # tags == # callers.
+            assert tag.startswith(f"caller{caller_id}_"), f"caller {caller_id} got {tag!r} — reply swap detected"
+        # Tag-count must equal caller count (defence in depth).
         assert len(set(results.values())) == n, "duplicate tags imply reply swap"
 
     def test_concurrent_request_and_collective_rpc_no_swap(self) -> None:

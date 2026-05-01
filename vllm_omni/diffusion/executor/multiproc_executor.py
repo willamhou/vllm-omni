@@ -33,11 +33,17 @@ _DEQUEUE_TIMEOUT_S = 5.0
 # without a message and the executor has not yet observed worker death.
 _DEQUEUE_NOTHING: Any = object()
 
-# Methods that mutate worker GPU memory residency and therefore cannot
-# safely interleave with an in-flight ``execute_model``. Step A ships a
-# placeholder constant; Step B will replace this with a per-RPC
-# annotation system (see RFC #3158, 2026-04-27 comment, deferred LoRA
-# debate).
+# Methods that mutate worker GPU memory residency. In Step A the
+# ``_serialize_lock`` only gates these methods against EACH OTHER so
+# two concurrent ``sleep`` calls cannot interleave. Cross-method
+# interleaving with ``execute_model`` / ``execute_stepwise`` is still
+# prevented by the engine-level ``DiffusionEngine._rpc_lock`` (which
+# Step A intentionally does not narrow); the codex review's
+# residency-race concern is therefore mitigated upstream until that
+# lock is removed in Step B. Step B will (a) narrow ``_rpc_lock`` and
+# (b) replace this literal frozenset with a per-RPC annotation system
+# that gates these methods against ``execute_model`` too. See
+# RFC #3158 4-27 comment for the deferred LoRA classification debate.
 _NON_INTERLEAVABLE_METHODS: frozenset[str] = frozenset({"sleep", "wake_up", "handle_sleep_task", "handle_wake_task"})
 
 
@@ -106,9 +112,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._pending: set[int] = set()
             self._inbox: dict[int, Any] = {}
         if not hasattr(self, "_serialize_lock"):
-            # Gates ``_NON_INTERLEAVABLE_METHODS`` against each other and
-            # against in-flight RPCs that hold it; this is the plug point
-            # Step B's annotation system will replace.
+            # Step A scope: gates ``_NON_INTERLEAVABLE_METHODS`` against
+            # EACH OTHER (e.g. two concurrent ``sleep`` calls). It does
+            # NOT gate against ``execute_model`` — that cross-method
+            # interleaving is still serialised by the engine-level
+            # ``DiffusionEngine._rpc_lock`` until Step B narrows it and
+            # replaces this lock with a per-RPC annotation system.
             self._serialize_lock = threading.Lock()
 
     def _init_executor(self) -> None:
@@ -434,10 +443,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         self._ensure_dispatch_state()
 
-        # Non-interleavable methods (sleep / wake_up / ...) mutate worker
-        # GPU memory residency, so they must serialise against everything
-        # else holding the executor. The annotation system is deferred to
-        # Step B; for now a literal frozenset gates the placeholder lock.
+        # TODO(step-b): replace this membership check with the per-RPC
+        # annotation system once ``DiffusionEngine._rpc_lock`` is
+        # narrowed. Step B will also widen this gate to serialise
+        # ``execute_model`` / ``execute_stepwise`` against members of
+        # ``_NON_INTERLEAVABLE_METHODS`` (Step A relies on the engine
+        # ``_rpc_lock`` for that cross-method serialisation).
         if method in _NON_INTERLEAVABLE_METHODS:
             with self._serialize_lock:
                 return self._collective_rpc_inner(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
@@ -492,10 +503,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"RPC call to {method} timed out.")
 
-                # 2) try to acquire the dequeue role
-                lock_timeout = remaining if remaining is not None else 0.5
-                if self._dequeue_lock.acquire(timeout=lock_timeout):
+                # 2) try to acquire the dequeue role. When the caller
+                #    has no deadline we block forever instead of waking
+                #    every 0.5 s — the dequeuer's ``finally`` fires
+                #    notify_all *and* releases the lock, so a parked
+                #    waiter is woken on either signal.
+                if remaining is None:
+                    self._dequeue_lock.acquire()
+                    acquired = True
+                else:
+                    acquired = self._dequeue_lock.acquire(timeout=remaining)
+                if acquired:
                     try:
+                        # Bail if shutdown landed between our acquire
+                        # request and grant; ``_result_mq`` may already
+                        # be torn down or about to be.
+                        if self._closed:
+                            raise RuntimeError(f"DiffusionExecutor closed while {method} was in flight.")
                         # re-check inbox after winning the role; a peer may
                         # have stashed our reply while we were contending
                         with self._dispatch_lock:
@@ -513,11 +537,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             continue
 
                         payload, msg_cid = self._unwrap_reply(response)
-                        # Backward-compat: untagged legacy reply routes to
-                        # the oldest pending cid (single-flight fallback).
+                        # Backward-compat: untagged legacy reply may come
+                        # from the ``add_req`` path (which never stamps a
+                        # cid) or from a pre-Step-A worker. Route it to
+                        # the in-flight ``collective_rpc`` waiter ONLY when
+                        # there is exactly one pending cid — otherwise the
+                        # mapping is ambiguous (e.g. an OmniACK from a
+                        # concurrent ``add_req`` could be misrouted to a
+                        # ``collective_rpc`` caller). Drop ambiguous ones
+                        # with a warning rather than silently corrupting a
+                        # waiter's reply.
                         if msg_cid is None:
                             with self._dispatch_lock:
-                                msg_cid = min(self._pending) if self._pending else None
+                                if len(self._pending) == 1:
+                                    msg_cid = next(iter(self._pending))
+                                else:
+                                    pending_count = len(self._pending)
+                                    msg_cid = None
+                            if msg_cid is None and pending_count != 0:
+                                logger.warning(
+                                    "dropping untagged legacy reply: %d pending cids make the routing ambiguous",
+                                    pending_count,
+                                )
 
                         if msg_cid == cid:
                             return _wrap(payload)
@@ -535,11 +576,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     with self._dispatch_cond:
                         if cid in self._inbox:
                             return _wrap(self._inbox.pop(cid))
-                        # Worker death observed by another caller's
-                        # dequeue chunk fans out via notify_all; honour
-                        # it here before sleeping again.
+                        # Honour worker death and executor shutdown
+                        # before sleeping again. ``_closed`` is set by
+                        # ``shutdown`` which also fires notify_all so
+                        # parked callers — including ones with
+                        # ``timeout=None`` — wake here and bail.
                         if self.is_failed:
                             raise EngineDeadError()
+                        if self._closed:
+                            raise RuntimeError(f"DiffusionExecutor closed while {method} was in flight.")
                         wait = None if deadline is None else max(0.0, deadline - time.monotonic())
                         if wait is not None and wait <= 0:
                             raise TimeoutError(f"RPC call to {method} timed out.")
