@@ -14,6 +14,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
@@ -72,6 +73,29 @@ def _move_tensors_to_cpu(data: Any) -> Any:
         moved = [_move_tensors_to_cpu(item) for item in data]
         return type(data)(moved)
     return data
+
+
+def _normalize_outputs(outputs: Any, expected_items: int) -> list[Any]:
+    """Normalize post-process outputs into a per-item list.
+
+    Batched tensors / ndarrays are only split when their leading dimension
+    exactly matches the number of expected request outputs. This avoids
+    misinterpreting a single waveform shaped like ``[samples]`` as a batched
+    result while still supporting models that return one tensor for the full
+    batch.
+    """
+    if isinstance(outputs, list):
+        return outputs
+    if outputs is None:
+        return []
+    if (
+        isinstance(outputs, (torch.Tensor, np.ndarray))
+        and outputs.ndim > 0
+        and expected_items > 1
+        and outputs.shape[0] == expected_items
+    ):
+        return [outputs[i] for i in range(expected_items)]
+    return [outputs]
 
 
 class DiffusionEngine:
@@ -134,7 +158,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise RuntimeError(f"{output.error}")
+            raise RuntimeError(output.error)
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -190,17 +214,11 @@ class DiffusionEngine:
             step_total_ms,
         )
 
-        # Convert to OmniRequestOutput format
-        # Ensure outputs is a list of per-sample items. Batched tensors/arrays
-        # (e.g. audio models returning a single tensor with batch dim) are split
-        # along dim 0 so each prompt gets its own slice.
-        if not isinstance(outputs, list):
-            if outputs is None:
-                outputs = []
-            elif isinstance(outputs, (torch.Tensor, np.ndarray)) and outputs.ndim > 0 and outputs.shape[0] > 1:
-                outputs = [outputs[i] for i in range(outputs.shape[0])]
-            else:
-                outputs = [outputs]
+        # Convert to OmniRequestOutput format. Batched tensors / arrays are
+        # only split when the leading dimension matches the total number of
+        # expected request outputs.
+        expected_items = len(request.prompts) * int(request.sampling_params.num_outputs_per_prompt)
+        outputs = _normalize_outputs(outputs, expected_items)
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
@@ -213,6 +231,15 @@ class DiffusionEngine:
 
         # Handle single request or multiple requests
         is_audio_output = supports_audio_output(self.od_config.model_class_name)
+        if is_audio_output and model_audio_sample_rate is None:
+            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
+
+        def _audio_mm(payload: Any) -> dict[str, Any]:
+            mm: dict[str, Any] = {"audio": payload}
+            if model_audio_sample_rate is not None:
+                mm["audio_sample_rate"] = model_audio_sample_rate
+            return mm
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
@@ -231,7 +258,7 @@ class DiffusionEngine:
                         trajectory_timesteps=output.trajectory_timesteps,
                         trajectory_log_probs=output.trajectory_log_probs,
                         trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output={"audio": request_audio_payload},
+                        multimodal_output=_audio_mm(request_audio_payload),
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -280,8 +307,6 @@ class DiffusionEngine:
 
                 # Batch-scoped metadata: only attach to first request to
                 # avoid duplicating engine-level data across per-request outputs.
-                # Batch-scoped metadata: only attach to first request to
-                # avoid duplicating engine-level data across per-request outputs.
                 latents = output.trajectory_latents if i == 0 else None
                 traj_latents = output.trajectory_latents if i == 0 else None
                 traj_timesteps = output.trajectory_timesteps if i == 0 else None
@@ -290,7 +315,6 @@ class DiffusionEngine:
                 custom = (custom_output if i == 0 else {})
                 durations = output.stage_durations if i == 0 else None
                 peak_mem = output.peak_memory_mb if i == 0 else None
-
                 if is_audio_output:
                     request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
@@ -304,7 +328,7 @@ class DiffusionEngine:
                             trajectory_timesteps=traj_timesteps,
                             trajectory_log_probs=traj_log_probs,
                             trajectory_decoded=traj_decoded,
-                            multimodal_output={"audio": request_audio_payload},
+                            multimodal_output=_audio_mm(request_audio_payload),
                             final_output_type="audio",
                             stage_durations=durations,
                             peak_memory_mb=peak_mem,
@@ -385,6 +409,8 @@ class DiffusionEngine:
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 try:
                     runner_output = self.execute_fn(sched_output)
+                except EngineDeadError:
+                    raise
                 except Exception as exc:
                     logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
                     runner_output = RunnerOutput(

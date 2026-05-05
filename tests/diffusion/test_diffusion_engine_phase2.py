@@ -42,6 +42,10 @@ def _load_engine_module():
         "vllm_omni.inputs": MagicMock(),
         "vllm_omni.inputs.data": MagicMock(),
         "vllm_omni.outputs": MagicMock(),
+        "vllm": types.ModuleType("vllm"),
+        "vllm.v1": types.ModuleType("vllm.v1"),
+        "vllm.v1.engine": types.ModuleType("vllm.v1.engine"),
+        "vllm.v1.engine.exceptions": MagicMock(),
         "vllm.logger": MagicMock(init_logger=lambda name: MagicMock()),
         "PIL": MagicMock(),
         "PIL.Image": MagicMock(),
@@ -55,6 +59,7 @@ def _load_engine_module():
 
 _engine_mod = _load_engine_module()
 _move_tensors_to_cpu = _engine_mod._move_tensors_to_cpu
+_normalize_outputs = _engine_mod._normalize_outputs
 
 
 class TestMoveTensorsToCpu:
@@ -109,42 +114,34 @@ class TestBatchedOutputSlicing:
     """Test that batched tensor outputs are properly split per-prompt."""
 
     def test_batched_tensor_is_split(self) -> None:
-        """A batched tensor with shape[0] > 1 should be split into a list."""
-        # Simulate the splitting logic from step()
+        """A batched tensor should be split when item count matches."""
         outputs = torch.randn(3, 16000)  # 3 audio samples batched
-        if not isinstance(outputs, list):
-            if isinstance(outputs, (torch.Tensor, np.ndarray)) and outputs.ndim > 0 and outputs.shape[0] > 1:
-                outputs = [outputs[i] for i in range(outputs.shape[0])]
-            else:
-                outputs = [outputs]
+        outputs = _normalize_outputs(outputs, expected_items=3)
         assert len(outputs) == 3
         assert outputs[0].shape == (16000,)
 
     def test_single_sample_not_split(self) -> None:
-        """A tensor with shape[0] == 1 should remain as single-element list."""
+        """A single sample tensor should remain one item."""
         outputs = torch.randn(1, 16000)
-        if not isinstance(outputs, list):
-            if isinstance(outputs, (torch.Tensor, np.ndarray)) and outputs.ndim > 0 and outputs.shape[0] > 1:
-                outputs = [outputs[i] for i in range(outputs.shape[0])]
-            else:
-                outputs = [outputs]
+        outputs = _normalize_outputs(outputs, expected_items=1)
         assert len(outputs) == 1
         assert outputs[0].shape == (1, 16000)
 
     def test_numpy_batched_is_split(self) -> None:
         """Batched numpy arrays should also be split."""
         outputs = np.random.randn(3, 16000)
-        if not isinstance(outputs, list):
-            if isinstance(outputs, (torch.Tensor, np.ndarray)) and outputs.ndim > 0 and outputs.shape[0] > 1:
-                outputs = [outputs[i] for i in range(outputs.shape[0])]
-            else:
-                outputs = [outputs]
+        outputs = _normalize_outputs(outputs, expected_items=3)
         assert len(outputs) == 3
 
     def test_list_passthrough(self) -> None:
         """A list output should not be modified."""
         outputs = [torch.randn(16000), torch.randn(16000)]
-        original_len = len(outputs)
-        if not isinstance(outputs, list):
-            outputs = [outputs]
-        assert len(outputs) == original_len
+        normalized = _normalize_outputs(outputs, expected_items=2)
+        assert normalized is outputs
+
+    def test_shape_mismatch_is_not_split(self) -> None:
+        """A 1D waveform should not be mistaken for a batch."""
+        outputs = torch.randn(16000)
+        normalized = _normalize_outputs(outputs, expected_items=2)
+        assert len(normalized) == 1
+        assert normalized[0].shape == (16000,)
